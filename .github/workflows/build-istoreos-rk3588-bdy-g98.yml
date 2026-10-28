@@ -1,0 +1,273 @@
+name: Build iStoreOS - RK3588 BDY-G98
+
+on:
+  workflow_dispatch:
+    inputs:
+      ENABLE_SSH:
+        description: "编译前开启在线SSH（可改.config，超时自动继续）"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      SSH_MINUTES:
+        description: "SSH等待时长（分钟），到时自动开始编译"
+        required: false
+        default: "10"
+      REPO_BRANCH:
+        description: "iStoreOS源码分支"
+        required: false
+        default: "istoreos-24.10"
+      CACHE_TOOLCHAIN:
+        description: "缓存工具链（第二次编译起显著加速）"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      FIRMWARE_RELEASE:
+        description: "编译完成后自动发布到Release"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+# 同一时间只跑一个构建，避免缓存/Release冲突
+concurrency:
+  group: istoreos-bdy-g98-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # ===== 源码 =====
+  REPO_URL: https://github.com/istoreos/istoreos.git
+  REPO_BRANCH: ${{ github.event.inputs.REPO_BRANCH || 'istoreos-24.10' }}
+
+  # ===== 配置 =====
+  CONFIG_FILE: configs/rk3588-bdy-g98.config
+  DIY_SCRIPT: diy/diy.sh
+
+  # ===== 行为开关 =====
+  ENABLE_SSH: ${{ github.event.inputs.ENABLE_SSH || 'true' }}
+  SSH_MINUTES: ${{ github.event.inputs.SSH_MINUTES || '10' }}
+  CACHE_TOOLCHAIN: ${{ github.event.inputs.CACHE_TOOLCHAIN || 'true' }}
+  UPLOAD_BIN_DIR: "false"
+  FIRMWARE_RELEASE: ${{ github.event.inputs.FIRMWARE_RELEASE || 'true' }}
+
+  TZ: Asia/Shanghai
+
+jobs:
+  Build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 720   # 硬上限 12 小时
+    steps:
+      - name: 检查服务器性能
+        run: |
+          echo "========== CPU =========="
+          echo "CPU核心数: $(nproc)"
+          echo "CPU型号: $(grep -m1 'model name' /proc/cpuinfo | awk -F: '{print $2}')"
+          echo "========== 内存 =========="
+          free -h
+          echo "========== 磁盘 =========="
+          df -hT
+
+      - name: 初始化环境
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo timedatectl set-timezone "Asia/Shanghai"
+          sudo -E apt-get update -y
+          sudo -E apt-get install -y ack antlr3 asciidoc autoconf automake autopoint \
+            binutils bison build-essential bzip2 ccache cmake cpio curl device-tree-compiler \
+            fastjar flex gawk gettext gcc-multilib g++-multilib git gperf haveged help2man \
+            intltool libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev \
+            libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libreadline-dev \
+            libssl-dev libtool lrzsz mkisofs msmtp nano ninja-build p7zip p7zip-full patch \
+            pkgconf python3 python3-pyelftools libpython3-dev qemu-utils rsync scons \
+            squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd \
+            zlib1g-dev libfuse-dev python3-setuptools genisoimage tmate
+          sudo -E apt-get clean
+          git config --global user.name 'GitHub Actions'
+          git config --global user.email 'noreply@github.com'
+
+      - name: 合并磁盘空间
+        uses: easimon/maximize-build-space@master
+        with:
+          swap-size-mb: 2048
+          temp-reserve-mb: 1024
+          root-reserve-mb: 1024
+
+      - name: 检出本仓库
+        uses: actions/checkout@main
+
+      - name: 克隆 iStoreOS 源码
+        run: |
+          df -hT "$GITHUB_WORKSPACE"
+          git clone $REPO_URL -b $REPO_BRANCH openwrt
+          cd openwrt
+          echo "DATE=$(date +'%Y-%m-%d %H:%M:%S')" >> "$GITHUB_ENV"
+          echo "OPENWRT_PATH=$PWD" >> "$GITHUB_ENV"
+
+      - name: 生成构建变量
+        run: |
+          cp "$CONFIG_FILE" "$OPENWRT_PATH/.config"
+          cd "$OPENWRT_PATH"
+          make defconfig >/dev/null 2>&1 || true
+
+          SOURCE_REPO="$(echo "$REPO_URL" | awk -F '/' '{print $NF}')"
+          echo "SOURCE_REPO=$SOURCE_REPO" >> "$GITHUB_ENV"
+
+          DEVICE_TARGET=$(grep CONFIG_TARGET_BOARD= .config | awk -F '"' '{print $2}')
+          DEVICE_SUBTARGET=$(grep CONFIG_TARGET_SUBTARGET= .config | awk -F '"' '{print $2}')
+          echo "DEVICE_TARGET=$DEVICE_TARGET"     >> "$GITHUB_ENV"
+          echo "DEVICE_SUBTARGET=$DEVICE_SUBTARGET" >> "$GITHUB_ENV"
+          echo "FIRMWARE_TAG=$(date +"%Y%m%d")"    >> "$GITHUB_ENV"
+
+          echo "================ 当前板子配置 ================"
+          grep -E 'CONFIG_TARGET_(BOARD|SUBTARGET|PROFILE|DEVICE_)' .config || true
+          echo "================================================"
+
+      - name: 缓存工具链
+        if: env.CACHE_TOOLCHAIN == 'true'
+        uses: HiGarfield/cachewrtbuild@main
+        with:
+          ccache: false
+          mixkey: ${{ env.SOURCE_REPO }}-${{ env.REPO_BRANCH }}-${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}
+          prefix: ${{ env.OPENWRT_PATH }}
+
+      - name: 安装 feeds
+        run: |
+          cd "$OPENWRT_PATH"
+          # === 按需追加你自己的第三方 feeds ===
+          # 例：istore 官方插件源
+          sed -i '1isrc-git istore_pkgs https://github.com/linkease/istore-packages.git;main' feeds.conf.default
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 加载自定义配置 + diy 脚本
+        run: |
+          [ -d files ] && mv files "$OPENWRT_PATH/files"
+          [ -e "$CONFIG_FILE" ] && cp "$CONFIG_FILE" "$OPENWRT_PATH/.config"
+          chmod +x "$DIY_SCRIPT"
+          cd "$OPENWRT_PATH"
+          "$GITHUB_WORKSPACE/$DIY_SCRIPT"
+          make defconfig >/dev/null 2>&1
+
+      # ============================================================
+      #  在线 SSH 窗口：编译前暂停 N 分钟，可上去改 .config
+      #  日志里会打印 ssh 连接串（形如 ssh xxx@xxx.tmate.io -p xxx）
+      #  上去后常用操作：
+      #     cd $OPENWRT_PATH
+      #     make menuconfig          # 选板子/插件
+      #     make kernel_menuconfig   # 改内核（如 PWM 风扇）
+      #     make defconfig
+      #     touch /tmp/continue      # 改完提前继续，不用等满 N 分钟
+      # ============================================================
+      - name: 🐚 在线 SSH 调试窗口（${{ env.SSH_MINUTES }} 分钟后自动编译）
+        id: ssh_window
+        if: env.ENABLE_SSH == 'true'
+        env:
+          SSH_SECONDS: ${{ format('{0}', (github.event.inputs.SSH_MINUTES || '10')) }}00
+        run: |
+          set +e
+          cd "$OPENWRT_PATH"
+
+          echo "================================================================"
+          echo " SSH 窗口已开启，等待 ${SSH_SECONDS} 秒后自动开始编译"
+          echo " 上去后可以：make menuconfig / make kernel_menuconfig / 改 .config"
+          echo " 改完执行: touch /tmp/continue   即可立即继续，不必等满"
+          echo "================================================================"
+
+          # 后台拉起 tmate（前台 -F 保持常驻）
+          # 打印 ssh 连接信息到日志
+          nohup tmate -F > /tmp/tmate.log 2>&1 &
+          TMATE_BG=$!
+
+          # 等 tmate 起来并写出连接串
+          for i in $(seq 1 30); do
+            sleep 1
+            SSH_LINE=$(grep -E 'ssh .*\.tmate\.io' /tmp/tmate.log | head -1)
+            [ -n "$SSH_LINE" ] && break
+          done
+
+          echo ""
+          echo "########## 你的 SSH 连接命令（复制到本机终端执行） ##########"
+          grep -E 'ssh .*\.tmate\.io' /tmp/tmate.log || echo "(未抓到连接串，请在本步骤日志里翻找 ssh 开头的行)"
+          echo "############################################################"
+          echo ""
+
+          # 等待 N 秒，或直到有人创建 /tmp/continue
+          DEADLINE=$(( $(date +%s) + SSH_SECONDS ))
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            sleep 5
+            if [ -f /tmp/continue ]; then
+              echo ">> 收到 /tmp/continue 信号，提前结束 SSH 窗口"
+              break
+            fi
+          done
+
+          # 清理 tmate
+          pkill -f tmate || true
+          sleep 1
+          echo ">> SSH 窗口结束，当前 .config 关键项："
+          grep -E 'CONFIG_TARGET_(BOARD|SUBTARGET|DEVICE_)' .config || true
+
+      - name: 下载软件包
+        run: |
+          cd "$OPENWRT_PATH"
+          make defconfig >/dev/null 2>&1
+          make download -j8
+          # 清理下载失败的 0 字节文件
+          find dl -size -1024c -exec rm -f {} \;
+
+      - name: 编译固件
+        id: compile
+        run: |
+          cd "$OPENWRT_PATH"
+          echo "$(nproc) 线程开始编译"
+          make -j"$(nproc)" || make -j1 V=s
+          echo "status=success" >> "$GITHUB_OUTPUT"
+          echo "FILE_DATE=$(date +"%Y.%m.%d")" >> "$GITHUB_ENV"
+
+      - name: 检查磁盘
+        if: always()
+        run: df -hT
+
+      - name: 整理产物
+        if: steps.compile.outputs.status == 'success'
+        run: |
+          cd "$OPENWRT_PATH/bin/targets/"*/*
+          echo "======== 本地产出文件 ========"
+          ls -lh
+          echo "=============================="
+          cp "$OPENWRT_PATH/.config" build.config
+          KERNEL=$(grep -m1 '^kernel' *.manifest | cut -d- -f2 | tr -d ' ')
+          echo "KERNEL=$KERNEL" >> "$GITHUB_ENV"
+          echo "FIRMWARE_PATH=$PWD" >> "$GITHUB_ENV"
+
+      - name: 上传固件到 Artifact
+        if: steps.compile.outputs.status == 'success' && env.FIRMWARE_RELEASE != 'true'
+        uses: actions/upload-artifact@main
+        with:
+          name: istoreos-bdy-g98-${{ env.FIRMWARE_TAG }}
+          path: ${{ env.FIRMWARE_PATH }}
+
+      - name: 发布到 Release
+        if: steps.compile.outputs.status == 'success' && env.FIRMWARE_RELEASE == 'true'
+        uses: ncipollo/release-action@v1
+        with:
+          name: iStoreOS RK3588 BDY-G98 ${{ env.DATE }}
+          allowUpdates: true
+          tag: bdy-g98-${{ env.FIRMWARE_TAG }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          artifacts: ${{ env.FIRMWARE_PATH }}/*
+          body: |
+            ### 固件信息
+            - 板卡: RK3588 BDY-G98
+            - 源码: ${{ env.REPO_URL }} @ ${{ env.REPO_BRANCH }}
+            - Target: ${{ env.DEVICE_TARGET }} / ${{ env.DEVICE_SUBTARGET }}
+            - 内核: ${{ env.KERNEL }}
+            - 默认地址: 192.168.2.1 / root / password
