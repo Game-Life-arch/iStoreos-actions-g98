@@ -186,7 +186,7 @@ jobs:
       - name: 🐚 启动在线 SSH（连接串见日志）
         id: ssh_start
         if: env.ENABLE_SSH == 'true'
-        run: pkill -f tmate 2>/dev/null; rm -rf /tmp/tmate-*; true
+        run: rm -rf /tmp/tmate-* /tmp/tmate.sock 2>/dev/null || true
 
       - name: 🐚 启动在线 SSH（连接串见日志）
         id: ssh_start2
