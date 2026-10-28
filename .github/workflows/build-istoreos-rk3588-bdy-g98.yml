@@ -186,11 +186,15 @@ jobs:
       - name: 🐚 启动在线 SSH（连接串见日志）
         id: ssh_start
         if: env.ENABLE_SSH == 'true'
+        run: pkill -f tmate 2>/dev/null; rm -rf /tmp/tmate-*; true
+
+      - name: 🐚 启动在线 SSH（连接串见日志）
+        id: ssh_start2
+        if: env.ENABLE_SSH == 'true'
         uses: mxschmitt/action-tmate@v3
-        timeout-minutes: 2
+        timeout-minutes: 5
         with:
           detached: true
-          limit-access-to-actor: true
 
       - name: ⏳ 等待 SSH 窗口结束（${{ env.SSH_MINUTES }} 分钟或 touch /tmp/continue）
         if: env.ENABLE_SSH == 'true'
