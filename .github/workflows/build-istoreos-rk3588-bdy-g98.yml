@@ -184,19 +184,73 @@ jobs:
       #     touch /tmp/continue      # 改完提前继续，不用等满 N 分钟
       # ============================================================
       # ============================================================
-      #  在线 SSH：用 mxschmitt 默认阻塞模式
-      #  - 日志里会直接打印 ssh ...tmate.io 连接串
-      #  - 连上后改 .config，exit 退出即继续编译
-      #  - 没人连则 12 分钟后超时自动继续（continue-on-error）
+      #  在线 SSH：裸 tmate，不依赖任何 action
+      #  - 下载官方静态二进制
+      #  - 日志直接打印 ssh 连接串
+      #  - 连上后改 .config，exit 即继续；10 分钟无人连自动继续
       # ============================================================
-      - name: 🐚 在线 SSH（12 分钟窗口，exit 或超时自动继续）
+      - name: 🐚 在线 SSH 调试窗口
         if: env.ENABLE_SSH == 'true'
-        uses: mxschmitt/action-tmate@v3
-        timeout-minutes: 12
         continue-on-error: true
-        with:
-          limit-access-to-actor: false
-          install-dependencies: false
+        timeout-minutes: 12
+        run: |
+          set +e
+          cd "$OPENWRT_PATH"
+
+          # 1. 下载官方静态 tmate
+          if ! command -v tmate >/dev/null; then
+            echo ">>> 下载 tmate 静态二进制..."
+            curl -sL https://github.com/tmate-io/tmate/releases/download/2.4.0/tmate-2.4.0-static-linux-x86_64.tar.xz -o /tmp/tmate.tar.xz
+            tar -xJf /tmp/tmate.tar.xz -C /tmp
+            sudo cp /tmp/tmate-2.4.0-static-linux-x86_64/tmate /usr/local/bin/
+          fi
+          which tmate && tmate -V
+
+          # 2. 准备 socket 目录
+          export TMATE_SOCKET_DIR=/tmp/tmate-sock
+          mkdir -p "$TMATE_SOCKET_DIR"
+
+          # 3. 用 script 分配伪 tty 启动 tmate -F（后台）
+          echo ">>> 启动 tmate..."
+          nohup script -q -e -c "tmate -F" /tmp/tmate.log >/dev/null 2>&1 &
+
+          # 4. 轮询获取 ssh 连接串（最多等 60 秒）
+          SOCK="$TMATE_SOCKET_DIR/tmate.sock"
+          SSH_CONN=""
+          for i in $(seq 1 60); do
+            sleep 1
+            SSH_CONN=$(tmate -S "$SOCK" display -p '#{tmate_ssh}' 2>/dev/null)
+            if [ -n "$SSH_CONN" ] && [[ "$SSH_CONN" == ssh* ]]; then
+              echo ">>> 连接串已获取"
+              break
+            fi
+          done
+
+          echo ""
+          echo "############################################################"
+          echo "#  SSH 连接命令（复制到本机终端执行）："
+          echo "#    ${SSH_CONN:-未获取到，见下方 tmate.log}"
+          echo "############################################################"
+          echo ""
+
+          if [ -z "$SSH_CONN" ]; then
+            echo "===== tmate.log ====="
+            cat /tmp/tmate.log 2>/dev/null
+            echo "===================="
+          fi
+
+          # 5. 阻塞等待：最多 10 分钟，或直到有人创建 /tmp/continue
+          SSH_SECONDS=$(( ${SSH_MINUTES:-10} * 60 ))
+          echo ">>> 等待 ${SSH_SECONDS} 秒，或直到 touch /tmp/continue"
+          DEADLINE=$(( $(date +%s) + SSH_SECONDS ))
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            sleep 5
+            [ -f /tmp/continue ] && { echo ">>> 收到 continue"; break; }
+          done
+
+          # 6. 清理
+          tmate -S "$SOCK" shutdown 2>/dev/null || true
+          echo ">> SSH 窗口结束"
 
       - name: 下载软件包
         run: |
