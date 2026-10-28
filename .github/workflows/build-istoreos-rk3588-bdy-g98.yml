@@ -184,11 +184,12 @@ jobs:
       - name: 🐚 在线 SSH 调试窗口（${{ env.SSH_MINUTES }} 分钟后自动编译）
         id: ssh_window
         if: env.ENABLE_SSH == 'true'
-        env:
-          SSH_SECONDS: ${{ (github.event.inputs.SSH_MINUTES || '10') * 60 }}
         run: |
           set +e
           cd "$OPENWRT_PATH"
+
+          # 在 shell 里算秒数（GitHub Actions YAML 表达式不支持乘法）
+          SSH_SECONDS=$(( ${SSH_MINUTES:-10} * 60 ))
 
           echo "================================================================"
           echo " SSH 窗口已开启，等待 ${SSH_SECONDS} 秒后自动开始编译"
@@ -196,37 +197,44 @@ jobs:
           echo " 改完执行: touch /tmp/continue   即可立即继续，不必等满"
           echo "================================================================"
 
-          # 用 daemon 模式启动 tmate，socket 会落在 /tmp/tmate-*/tmate.sock
-          tmate -d 2>/tmp/tmate-boot.log
-          sleep 2
+          # 固定 socket 目录，方便查找
+          export TMATE_SOCKET_DIR=/tmp/tmate-sock
+          mkdir -p "$TMATE_SOCKET_DIR"
 
-          # 找 socket 文件
-          SOCK=""
-          for i in $(seq 1 30); do
-            SOCK=$(ls /tmp/tmate-*/tmate.sock 2>/dev/null | head -1)
-            [ -n "$SOCK" ] && break
-            sleep 1
-          done
+          # 用 script 分配伪 tty 启动 tmate -F（GitHub Actions 非交互 shell 必须）
+          # 后台跑，日志写到 /tmp/tmate.log
+          nohup script -q -e -c "tmate -F" /tmp/tmate.log >/dev/null 2>&1 &
+          SCRIPT_PID=$!
 
-          # 通过 socket 查询 ssh / web 连接串
+          # 等 tmate 连上后端并生成连接串
+          SOCK="$TMATE_SOCKET_DIR/tmate.sock"
           SSH_CONN=""
           WEB_CONN=""
-          for i in $(seq 1 30); do
-            SSH_CONN=$(tmate -S "$SOCK" display -p '#{tmate_ssh}' 2>/dev/null)
-            [ -n "$SSH_CONN" ] && [[ "$SSH_CONN" == ssh* ]] && break
+          for i in $(seq 1 60); do
             sleep 1
+            SSH_CONN=$(tmate -S "$SOCK" display -p '#{tmate_ssh}' 2>/dev/null)
+            if [ -n "$SSH_CONN" ] && [[ "$SSH_CONN" == ssh* ]]; then
+              WEB_CONN=$(tmate -S "$SOCK" display -p '#{tmate_web}' 2>/dev/null)
+              break
+            fi
           done
-          WEB_CONN=$(tmate -S "$SOCK" display -p '#{tmate_web}' 2>/dev/null)
 
           echo ""
           echo "############################################################"
           echo "#  SSH 连接命令（复制到本机终端执行）："
-          echo "#    $SSH_CONN"
+          echo "#    ${SSH_CONN:-未获取到，请看下方日志排查}"
           echo "#"
           echo "#  Web SSH（浏览器直接打开）："
-          echo "#    $WEB_CONN"
+          echo "#    ${WEB_CONN:-}"
           echo "############################################################"
           echo ""
+
+          # 兜底：如果还是没拿到，把 tmate 启动日志打出来排错
+          if [ -z "$SSH_CONN" ]; then
+            echo "===== tmate.log（排查用） ====="
+            cat /tmp/tmate.log 2>/dev/null
+            echo "=============================="
+          fi
 
           # 等待 N 秒，或直到有人创建 /tmp/continue
           DEADLINE=$(( $(date +%s) + SSH_SECONDS ))
@@ -241,6 +249,7 @@ jobs:
           # 清理 tmate
           tmate -S "$SOCK" shutdown 2>/dev/null
           pkill -f tmate || true
+          pkill -f "script -q" || true
           sleep 1
           echo ">> SSH 窗口结束，当前 .config 关键项："
           grep -E 'CONFIG_TARGET_(BOARD|SUBTARGET|DEVICE_)' .config || true
