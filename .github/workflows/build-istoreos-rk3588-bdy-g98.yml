@@ -185,7 +185,7 @@ jobs:
         id: ssh_window
         if: env.ENABLE_SSH == 'true'
         env:
-          SSH_SECONDS: ${{ format('{0}', (github.event.inputs.SSH_MINUTES || '10')) }}00
+          SSH_SECONDS: ${{ (github.event.inputs.SSH_MINUTES || '10') * 60 }}
         run: |
           set +e
           cd "$OPENWRT_PATH"
@@ -196,21 +196,35 @@ jobs:
           echo " 改完执行: touch /tmp/continue   即可立即继续，不必等满"
           echo "================================================================"
 
-          # 后台拉起 tmate（前台 -F 保持常驻）
-          # 打印 ssh 连接信息到日志
-          nohup tmate -F > /tmp/tmate.log 2>&1 &
-          TMATE_BG=$!
+          # 用 daemon 模式启动 tmate，socket 会落在 /tmp/tmate-*/tmate.sock
+          tmate -d 2>/tmp/tmate-boot.log
+          sleep 2
 
-          # 等 tmate 起来并写出连接串
+          # 找 socket 文件
+          SOCK=""
           for i in $(seq 1 30); do
+            SOCK=$(ls /tmp/tmate-*/tmate.sock 2>/dev/null | head -1)
+            [ -n "$SOCK" ] && break
             sleep 1
-            SSH_LINE=$(grep -E 'ssh .*\.tmate\.io' /tmp/tmate.log | head -1)
-            [ -n "$SSH_LINE" ] && break
           done
 
+          # 通过 socket 查询 ssh / web 连接串
+          SSH_CONN=""
+          WEB_CONN=""
+          for i in $(seq 1 30); do
+            SSH_CONN=$(tmate -S "$SOCK" display -p '#{tmate_ssh}' 2>/dev/null)
+            [ -n "$SSH_CONN" ] && [[ "$SSH_CONN" == ssh* ]] && break
+            sleep 1
+          done
+          WEB_CONN=$(tmate -S "$SOCK" display -p '#{tmate_web}' 2>/dev/null)
+
           echo ""
-          echo "########## 你的 SSH 连接命令（复制到本机终端执行） ##########"
-          grep -E 'ssh .*\.tmate\.io' /tmp/tmate.log || echo "(未抓到连接串，请在本步骤日志里翻找 ssh 开头的行)"
+          echo "############################################################"
+          echo "#  SSH 连接命令（复制到本机终端执行）："
+          echo "#    $SSH_CONN"
+          echo "#"
+          echo "#  Web SSH（浏览器直接打开）："
+          echo "#    $WEB_CONN"
           echo "############################################################"
           echo ""
 
@@ -225,6 +239,7 @@ jobs:
           done
 
           # 清理 tmate
+          tmate -S "$SOCK" shutdown 2>/dev/null
           pkill -f tmate || true
           sleep 1
           echo ">> SSH 窗口结束，当前 .config 关键项："
