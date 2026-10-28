@@ -93,23 +93,38 @@ jobs:
           git config --global user.name 'GitHub Actions'
           git config --global user.email 'noreply@github.com'
 
-      - name: 合并磁盘空间
-        uses: easimon/maximize-build-space@master
-        with:
-          swap-size-mb: 2048
-          temp-reserve-mb: 1024
-          root-reserve-mb: 1024
+      - name: 清理无用大文件 + 挂 swap（替代 maximize-build-space）
+        run: |
+          echo "===== 清理前磁盘 ====="
+          df -hT
+          # 删掉 runner 上根本用不到的大目录，腾根盘
+          sudo rm -rf /usr/share/dotnet \
+                      /usr/local/lib/android \
+                      /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL \
+                      /usr/local/.ghcup \
+                      /usr/share/swift \
+                      /var/lib/docker
+          # 加 4G swap 到大盘 /mnt
+          sudo fallocate -l 4G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          echo "===== 清理后磁盘 ====="
+          df -hT
+          free -h
 
       - name: 检出本仓库
         uses: actions/checkout@main
 
-      - name: 克隆 iStoreOS 源码
+      - name: 克隆 iStoreOS 源码（放到大盘 /mnt）
         run: |
-          df -hT "$GITHUB_WORKSPACE"
-          git clone $REPO_URL -b $REPO_BRANCH openwrt
-          cd openwrt
+          # /mnt 是 runner 上的数据盘（通常 50G+），把编译目录放这
+          sudo mkdir -p /mnt/openwrt && sudo chown -R runner:docker /mnt/openwrt
+          df -hT /mnt
+          git clone $REPO_URL -b $REPO_BRANCH /mnt/openwrt
           echo "DATE=$(date +'%Y-%m-%d %H:%M:%S')" >> "$GITHUB_ENV"
-          echo "OPENWRT_PATH=$PWD" >> "$GITHUB_ENV"
+          echo "OPENWRT_PATH=/mnt/openwrt" >> "$GITHUB_ENV"
 
       - name: 生成构建变量
         run: |
