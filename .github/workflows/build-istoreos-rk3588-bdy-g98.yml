@@ -183,35 +183,20 @@ jobs:
       #     make defconfig
       #     touch /tmp/continue      # 改完提前继续，不用等满 N 分钟
       # ============================================================
-      - name: 🐚 启动在线 SSH（连接串见日志）
-        id: ssh_start
-        if: env.ENABLE_SSH == 'true'
-        run: rm -rf /tmp/tmate-* /tmp/tmate.sock 2>/dev/null || true
-
-      - name: 🐚 启动在线 SSH（连接串见日志）
-        id: ssh_start2
+      # ============================================================
+      #  在线 SSH：用 mxschmitt 默认阻塞模式
+      #  - 日志里会直接打印 ssh ...tmate.io 连接串
+      #  - 连上后改 .config，exit 退出即继续编译
+      #  - 没人连则 12 分钟后超时自动继续（continue-on-error）
+      # ============================================================
+      - name: 🐚 在线 SSH（12 分钟窗口，exit 或超时自动继续）
         if: env.ENABLE_SSH == 'true'
         uses: mxschmitt/action-tmate@v3
-        timeout-minutes: 5
+        timeout-minutes: 12
+        continue-on-error: true
         with:
-          detached: true
-
-      - name: ⏳ 等待 SSH 窗口结束（${{ env.SSH_MINUTES }} 分钟或 touch /tmp/continue）
-        if: env.ENABLE_SSH == 'true'
-        run: |
-          SSH_SECONDS=$(( ${SSH_MINUTES:-10} * 60 ))
-          echo "等待 ${SSH_SECONDS} 秒，或直到在 SSH 里执行 touch /tmp/continue"
-          DEADLINE=$(( $(date +%s) + SSH_SECONDS ))
-          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-            sleep 5
-            if [ -f /tmp/continue ]; then
-              echo ">> 收到 /tmp/continue，提前继续"
-              break
-            fi
-          done
-          echo ">> SSH 窗口结束，当前 .config 关键项："
-          cd "$OPENWRT_PATH"
-          grep -E 'CONFIG_TARGET_(BOARD|SUBTARGET|DEVICE_)' .config || true
+          limit-access-to-actor: false
+          install-dependencies: false
 
       - name: 下载软件包
         run: |
